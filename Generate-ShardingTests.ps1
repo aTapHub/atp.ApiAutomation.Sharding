@@ -67,7 +67,7 @@ for ($classIndex = 0; $classIndex -lt $classCount; $classIndex++) {
 namespace atp.ApiAutomation.Sharding.Tests
 {
     [TestFixture]
-    [Parallelizable(ParallelScope.Fixtures)]
+    [Parallelizable(ParallelScope.All)]
     public class $className : BaseTest
     {
 $($testMethods -join "`n`n")

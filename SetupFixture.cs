@@ -20,7 +20,12 @@ namespace atp.ApiAutomation.Sharding
         {
             // Dependency injection container - built once and shared across all
             // fixtures, same shape as atp.ApiAutomation.Framework's SetupFixture.
+            var redisConnection = Environment.GetEnvironmentVariable("REDIS_CONNECTION") ?? "localhost:6379";
+            var bucketCapacity = int.Parse(Environment.GetEnvironmentVariable("BUCKET_CAPACITY") ?? "25");
+            var refillPerSecond = int.Parse(Environment.GetEnvironmentVariable("REFILL_PER_SECOND") ?? "10");
+
             var services = new ServiceCollection();
+            services.AddSingleton<IRateLimiterService>(new RedisRateLimiterService(redisConnection, bucketCapacity, refillPerSecond));
             services.AddTransient<ISleepService, SleepService>();
             ServiceProvider = services.BuildServiceProvider();
 

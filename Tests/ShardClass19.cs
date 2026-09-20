@@ -1,7 +1,7 @@
 namespace atp.ApiAutomation.Sharding.Tests
 {
     [TestFixture]
-    [Parallelizable(ParallelScope.Fixtures)]
+    [Parallelizable(ParallelScope.All)]
     public class ShardClass19 : BaseTest
     {
         [Test]

@@ -3,7 +3,7 @@ using AventStack.ExtentReports;
 using Microsoft.Extensions.DependencyInjection;
 using NUnit.Framework;
 
-[assembly: LevelOfParallelism(4)]
+[assembly: LevelOfParallelism(75)]
 namespace atp.ApiAutomation.Sharding.Tests
 {
     public class BaseTest
