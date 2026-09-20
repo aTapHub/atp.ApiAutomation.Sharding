@@ -6,7 +6,10 @@ namespace atp.ApiAutomation.Sharding.Services
     // every pod/shard, simulating a rate-limited AUT (e.g. "N requests/sec,
     // burst up to M"). Backed by Redis so bucket state is shared across
     // processes, not just in-memory.
-    public class RedisRateLimiterService : IRateLimiterService, IDisposable
+    // Throughput-only gate - deliberately doesn't implement IRateLimiterService
+    // (no Release: a spent token is never given back, only refilled by time).
+    // Composed into CompositeRateLimiterService alongside a local concurrency gate.
+    public class RedisRateLimiterService : IDisposable
     {
         private const string BucketKey = "sharding:ratelimiter:bucket";
         private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(50);

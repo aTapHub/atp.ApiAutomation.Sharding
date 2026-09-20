@@ -23,9 +23,11 @@ namespace atp.ApiAutomation.Sharding
             var redisConnection = Environment.GetEnvironmentVariable("REDIS_CONNECTION") ?? "localhost:6379";
             var bucketCapacity = int.Parse(Environment.GetEnvironmentVariable("BUCKET_CAPACITY") ?? "25");
             var refillPerSecond = int.Parse(Environment.GetEnvironmentVariable("REFILL_PER_SECOND") ?? "10");
+            var localConcurrencyLimit = int.Parse(Environment.GetEnvironmentVariable("LOCAL_CONCURRENCY_LIMIT") ?? "25");
 
+            var tokenBucket = new RedisRateLimiterService(redisConnection, bucketCapacity, refillPerSecond);
             var services = new ServiceCollection();
-            services.AddSingleton<IRateLimiterService>(new RedisRateLimiterService(redisConnection, bucketCapacity, refillPerSecond));
+            services.AddSingleton<IRateLimiterService>(new CompositeRateLimiterService(localConcurrencyLimit, tokenBucket));
             services.AddTransient<ISleepService, SleepService>();
             ServiceProvider = services.BuildServiceProvider();
 

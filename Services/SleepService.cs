@@ -12,7 +12,14 @@ namespace atp.ApiAutomation.Sharding.Services
         public void Sleep(int milliseconds)
         {
             _rateLimiter.Acquire();
-            Thread.Sleep(milliseconds);
+            try
+            {
+                Thread.Sleep(milliseconds);
+            }
+            finally
+            {
+                _rateLimiter.Release();
+            }
         }
     }
 }
