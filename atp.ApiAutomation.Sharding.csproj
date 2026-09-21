@@ -24,4 +24,10 @@
     <Using Include="NUnit.Framework" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Tools/ShardPlanner is its own standalone project - without this,
+         the default recursive glob pulls in its generated obj/ files too. -->
+    <Compile Remove="Tools/**/*.cs" />
+  </ItemGroup>
+
 </Project>
