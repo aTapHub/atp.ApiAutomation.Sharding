@@ -1,13 +1,14 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: sharding-poc
----
+# Lives in api-automation, not a separate namespace - shares it with
+# atp.ApiAutomation.Portfolio and this repo's own Job/PVC/image resources
+# (a Phase 2 decision made after this manifest was first written), so the
+# existing least-privilege ci-job-runner Role (scoped only to
+# api-automation, RBAC/namespaces deliberately out of the CI pipeline's
+# own reach) can apply it without any admin-side RBAC change.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: redis
-  namespace: sharding-poc
+  namespace: api-automation
 spec:
   replicas: 1
   selector:
@@ -35,7 +36,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: redis
-  namespace: sharding-poc
+  namespace: api-automation
 spec:
   selector:
     app: redis

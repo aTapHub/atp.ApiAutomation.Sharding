@@ -58,7 +58,7 @@ spec:
               dotnet test --filter "$FILTER"
           env:
             - name: REDIS_CONNECTION
-              value: redis.sharding-poc.svc.cluster.local:6379
+              value: redis:6379
           volumeMounts:
             - name: workspace
               mountPath: /app

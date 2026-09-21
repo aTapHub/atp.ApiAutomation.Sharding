@@ -6,8 +6,8 @@
 # that same volume at /app.
 #
 # No AUT here (unlike Portfolio) - the only external dependency is the
-# rate-limiter Redis deployed by ../k8s/redis.yaml into the sharding-poc
-# namespace, reached cross-namespace via its cluster DNS name.
+# rate-limiter Redis deployed by ../k8s/redis.yaml into this same
+# namespace.
 #
 # Fixtures still run at LevelOfParallelism(75)/ParallelScope.All even in
 # this "single-runner" baseline - intentional, not a bug: shows what
@@ -46,7 +46,7 @@ spec:
           image: 192.168.0.139:30003/learning/api-automation-sharding:latest
           env:
             - name: REDIS_CONNECTION
-              value: redis.sharding-poc.svc.cluster.local:6379
+              value: redis:6379
           volumeMounts:
             - name: workspace
               mountPath: /app
