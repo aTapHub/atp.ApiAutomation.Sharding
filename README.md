@@ -24,6 +24,98 @@ be true for the proof to mean anything:
 2. **The sharding algorithm must account for that unevenness** - balance
    shards by expected duration, not by test count.
 
+## Architecture
+
+Everything in this repo exists to answer the question at the top, and each
+piece maps to one part of that question:
+
+```
+Generate-ShardingTests.ps1 (seeded, deterministic)
+        |
+        v
+  Tests/*.cs (500 tests)  +  test-durations.json (name -> duration ms)
+        |                            |
+        |                            v
+        |                    Tools/ShardPlanner
+        |                    greedy bin-packing:
+        |                    --shards N --index I
+        |                    -> NUnit --filter expr
+        |                            |
+        v                            v
+  Dockerfile (SDK + restored          |
+  packages + prebuilt ShardPlanner)   |
+        |                             |
+        v                             |
+  Kaniko build Job (k8s/kaniko-build-job.yaml)
+  builds straight from this repo's git URL, pushes to Harbor
+        |
+        v
+  Kubernetes Job, one of two shapes:
+    - k8s/test-job.yaml            (single pod, all 500 tests)
+    - k8s/test-job-sharded.yaml    (Indexed Job, N pods, each reads
+                                     JOB_COMPLETION_INDEX, computes its
+                                     shard via ShardPlanner, runs
+                                     `dotnet test --filter`)
+        |
+        v
+  Each pod: initContainer clones fresh source into a shared PVC
+  (subPathExpr: shard-$(JOB_COMPLETION_INDEX) isolates pods sharing
+  one PVC - see k8s/test-workspace-pvc.yaml)
+        |
+        v
+  SetupFixture builds a DI container -> SleepService.Sleep(ms)
+        |
+        v
+  Rate limiter gate (Services/CompositeRateLimiterService.cs):
+    local SemaphoreSlim (per-pod concurrency)
+        -> Redis token bucket (cluster-wide throughput, k8s/redis.yaml)
+        |
+        v
+  Thread.Sleep(ms)  ->  ExtentReport  ->  Job status (start/completionTime)
+        |
+        v
+  .github/workflows/sharding-pipeline.yml (workflow_dispatch: mode,
+  shard_count) orchestrates all of the above end to end and writes the
+  wall-clock comparison to $GITHUB_STEP_SUMMARY
+```
+
+**Why each piece is separate, not bundled:**
+
+- **Test generation is decoupled from test running.** `Generate-ShardingTests.ps1`
+  runs once, offline, and produces both the `.cs` files and the manifest
+  together so they can never drift out of sync with each other - the
+  manifest is the ground truth `ShardPlanner` partitions against, not a
+  guess derived from parsing test names at run time.
+- **`ShardPlanner` is a standalone project, not a script.** It has to run
+  *inside* the pod (no PowerShell in the `mcr.microsoft.com/dotnet/sdk`
+  image), independently, once per pod - each pod computes the same global
+  partition itself and takes only its own slice, rather than one central
+  process handing out assignments. That only works because the algorithm is
+  deterministic given the same manifest; this was verified directly (each
+  pod's real executed-test list diffed against a local reference
+  computation), not assumed.
+- **The rate limiter is two separate mechanisms, not one**, because they
+  bound different things: the local `SemaphoreSlim` caps concurrency *within
+  one pod* (cheap, in-memory, checked first); the Redis token bucket caps
+  throughput *across every pod at once* (a network round trip, only paid if
+  the local gate already passed). A concurrency cap alone can't model "the
+  AUT's shared quota" across pods, and a cluster-wide semaphore alone can't
+  model *sustained rate* - it only bounds how many are in flight at once, not
+  how many can happen per second over time, which is what a real rate limit
+  actually constrains.
+- **The image never bakes in test source.** The Kaniko-built image only has
+  the SDK, restored NuGet packages, and prebuilt `ShardPlanner` - actual test
+  source is cloned fresh into the PVC at run time by an initContainer. This
+  means a code change never requires an image rebuild (the pipeline only
+  rebuilds when `Dockerfile`/`.csproj`/`ShardPlanner` themselves change), and
+  the single-runner and sharded Jobs can share one image unmodified.
+- **The CI pipeline is this repo's own**, independent of
+  `atp.ApiAutomation.Portfolio` - a dedicated ARC runner scale set
+  (`sharding-runners`, isolated from Portfolio's `talos-runners`) and its own
+  minimal RBAC (`k8s/rbac.yaml`, no Secrets access - there's no AUT here to
+  authenticate against), so every experiment in this repo runs without
+  depending on or competing with Portfolio's real pipeline.
+
 ## The mock test suite
 
 500 tests across 50 fixture classes (10 each), architected the same way as
