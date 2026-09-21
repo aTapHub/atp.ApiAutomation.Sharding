@@ -33,10 +33,24 @@ the real framework's tests - not a flat pile of `Thread.Sleep` calls:
   `OneTimeSetUp`, same shape as `atp.ApiAutomation.Framework`'s.
 - Each test resolves `ISleepService` via DI and calls `Sleep(ms)` - the DI
   path is genuinely exercised, not decorative.
-- `[Parallelizable(ParallelScope.Fixtures)]` + `[assembly:
-  LevelOfParallelism(4)]` - fixtures run in parallel, tests within a fixture
-  run sequentially. Same concurrency model the real suite already uses.
+- `[Parallelizable(ParallelScope.All)]` + `[assembly: LevelOfParallelism(75)]`
+  - fixtures and tests within them both run concurrently, deliberately raised
+  well above the rate limiter's capacity (below) so the limiter actually has
+  contention to throttle, rather than sitting idle under a cap concurrency
+  could never reach.
 - The same `ExtentReports` HTML reporting setup.
+
+### Rate limiter: simulating a real AUT's throughput cap
+
+A mock suite that starts every test instantly whenever a slot is free isn't
+realistic - a real AUT would rate-limit you. `SleepService` is gated by a
+cluster-wide Redis-backed **token bucket** (capacity 25, refill 10/sec,
+[Services/RedisRateLimiterService.cs](Services/RedisRateLimiterService.cs)),
+layered behind a local `SemaphoreSlim` (per-pod concurrency cap, checked
+first since it's free, before paying for a Redis round trip). Both numbers
+stay **fixed regardless of shard count** - a real AUT's quota doesn't grow
+just because more pods are hitting it, and this is what makes the plateau in
+the results below happen at all.
 
 Each test's sleep duration is **fixed at generation time** - the same every
 run, never randomized at runtime. What's randomized is which duration lands
@@ -58,15 +72,49 @@ Duration distribution across the 500 tests:
 duration - the source of truth a future sharding tool reads from to compute
 a balanced partition, rather than guessing from test names or class count.
 
+## Results
+
+All four runs below went through this repo's own CI pipeline
+([.github/workflows/sharding-pipeline.yml](.github/workflows/sharding-pipeline.yml),
+`workflow_dispatch` with `mode`/`shard_count` inputs), on the real Talos
+cluster, wall-clock timed from Kubernetes Job start to completion:
+
+| Mode | Wall-clock | Result |
+| --- | --- | --- |
+| Single runner (N=1) | 182s | 500/500 passed |
+| Sharded, N=4 | 90s | 500/500 passed (125 per shard) |
+| Sharded, N=8 | 93s | 500/500 passed (62-63 per shard) |
+| Sharded, N=12 | 90s | 500/500 passed (41-42 per shard) |
+
+**Sharding helps, then plateaus.** 1→4 shards roughly halves the wall-clock
+time (182s → 90s). But 4→8→12 shards buys essentially nothing further - all
+three sit at ~90s, within run-to-run noise. This is the rate limiter doing
+exactly what it's supposed to: past N=4, the bottleneck isn't "how many pods
+can run concurrently" anymore, it's the shared token bucket that every shard
+draws from regardless of pod count. More shards just means more pods queuing
+on the same fixed-size limiter, not more throughput - the same shape you'd
+see hitting a real rate-limited API with an ever-larger test farm.
+
+Partition correctness was verified directly, not assumed: every sharded
+run's actual executed-test list was diffed against
+[Tools/ShardPlanner](Tools/ShardPlanner)'s locally-computed reference
+partition for the same shard count and index, confirming zero overlap and
+zero gaps across all 500 tests in every run.
+
 ## Status
 
 - [x] Mock test suite generated and verified (compiles, runs, DI resolves,
       report generates correctly).
-- [ ] Baseline: run all 500 on a single runner, record wall-clock time.
-- [ ] Sharding algorithm: partition the 500 tests across N shards by known
-      duration (greedy bin-packing), not by count.
-- [ ] Horizontal pod scaling wrapper: a Kubernetes Indexed Job
-      (`completionMode: Indexed`, `parallelism: N`), each pod running its
-      own shard.
-- [ ] Comparison: single-runner time vs. sharded time across a few values
-      of N.
+- [x] Rate limiter: cluster-wide Redis token bucket + local concurrency
+      semaphore, simulating a rate-limited AUT.
+- [x] Baseline: single-runner wall-clock time recorded (182s, see Results).
+- [x] Sharding algorithm: `Tools/ShardPlanner` partitions the 500 tests
+      across N shards by known duration (greedy bin-packing), verified
+      balanced (<0.5% spread) for N=2,4,8,16.
+- [x] Horizontal pod scaling wrapper: a Kubernetes Indexed Job
+      (`completionMode: Indexed`, `parallelism`/`completions: N`,
+      `k8s/test-job-sharded.yaml`), each pod reading `JOB_COMPLETION_INDEX`
+      to compute and run its own shard.
+- [x] Comparison: single-runner time vs. sharded time across N=4,8,12 (see
+      Results) - run via this repo's own CI pipeline, independent of
+      `atp.ApiAutomation.Portfolio`.
