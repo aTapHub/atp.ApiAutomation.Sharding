@@ -9,4 +9,14 @@ WORKDIR /app
 COPY atp.ApiAutomation.Sharding.csproj ./
 RUN dotnet restore atp.ApiAutomation.Sharding.csproj
 
+# ShardPlanner (Phase 3) is prebuilt to a fixed path outside /app, since
+# /app gets overwritten by whatever the test Job mounts there at run time.
+# Sharded runs invoke it via `dotnet /opt/shardplanner/ShardPlanner.dll`.
+WORKDIR /shardplanner-src
+COPY Tools/ShardPlanner/ShardPlanner.csproj ./
+RUN dotnet restore ShardPlanner.csproj
+COPY Tools/ShardPlanner/Program.cs ./
+RUN dotnet publish ShardPlanner.csproj -c Release -o /opt/shardplanner --no-restore
+
+WORKDIR /app
 ENTRYPOINT ["dotnet", "test"]

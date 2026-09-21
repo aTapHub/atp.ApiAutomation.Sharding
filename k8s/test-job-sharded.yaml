@@ -1,0 +1,76 @@
+# Phase 4: horizontal pod scaling via a Kubernetes Indexed Job. Each of the
+# `completions` pods gets a distinct JOB_COMPLETION_INDEX (injected
+# automatically by the Job controller for completionMode: Indexed - no
+# manual wiring needed), computes its own shard via ShardPlanner
+# (Tools/ShardPlanner, Phase 3), and runs only that shard's tests.
+#
+# N (shard count) is hardcoded here for this manual verification run -
+# Phase 5 will parameterize it via workflow_dispatch when this gets wired
+# into CI.
+#
+# PVC concurrency: all pods share ONE PersistentVolumeClaim
+# (sharding-test-workspace, from test-workspace-pvc.yaml - reused from
+# Phase 2), but each mounts a distinct subdirectory of it via subPathExpr
+# keyed on $(JOB_COMPLETION_INDEX) - applied to BOTH the initContainer's
+# clone target and the main container's /app mount. This gives every pod
+# an isolated workspace slice of the shared volume: no clone races, no
+# report-file collisions, without needing N separate PVCs. This is the
+# concrete mechanism behind the TODO's "each pod writes into its own
+# subdirectory of a shared PVC" plan - verify it actually holds up under
+# real concurrent pod scheduling before trusting it, don't just assume.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sharding-run-tests-sharded
+  namespace: api-automation
+spec:
+  completionMode: Indexed
+  parallelism: 4
+  completions: 4
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: harbor-push-creds
+      initContainers:
+        - name: clone-source
+          image: alpine/git:2.47.1
+          command: ["sh", "-c"]
+          args:
+            - >-
+              rm -rf /workspace/* /workspace/.[!.]* 2>/dev/null;
+              git clone --depth=1 --branch=main
+              https://github.com/aTapHub/atp.ApiAutomation.Sharding.git /workspace
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+              subPathExpr: shard-$(JOB_COMPLETION_INDEX)
+      containers:
+        - name: test
+          image: 192.168.0.139:30003/learning/api-automation-sharding:latest
+          command: ["sh", "-c"]
+          args:
+            - >-
+              FILTER=$(dotnet /opt/shardplanner/ShardPlanner.dll
+              --shards 4 --index $JOB_COMPLETION_INDEX --manifest test-durations.json) &&
+              dotnet test --filter "$FILTER"
+          env:
+            - name: REDIS_CONNECTION
+              value: redis.sharding-poc.svc.cluster.local:6379
+          volumeMounts:
+            - name: workspace
+              mountPath: /app
+              subPathExpr: shard-$(JOB_COMPLETION_INDEX)
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: sharding-test-workspace
