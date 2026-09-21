@@ -1,0 +1,172 @@
+name: Sharding PoC Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: single runner, or sharded across N pods
+        type: choice
+        options: [single, sharded]
+        default: single
+      shard_count:
+        description: Shard count (sharded mode only)
+        type: number
+        default: 4
+
+jobs:
+  run:
+    runs-on: sharding-runners
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 # need the previous commit to diff against below
+
+      - name: Install kubectl
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -LO "https://dl.k8s.io/release/v1.37.0/bin/linux/amd64/kubectl"
+          install -m 0755 kubectl "$HOME/bin/kubectl"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          "$HOME/bin/kubectl" version --client
+
+      # Namespace and RBAC (k8s/rbac.yaml) are one-time cluster setup applied
+      # by an admin kubeconfig - this dedicated ServiceAccount deliberately
+      # can't touch either itself, mirroring Portfolio's own pipeline.
+      - name: Determine run mode
+        id: mode
+        run: |
+          echo "mode=${{ github.event.inputs.mode || 'single' }}" >> "$GITHUB_OUTPUT"
+          echo "shard_count=${{ github.event.inputs.shard_count || '4' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether the image needs rebuilding
+        id: image-deps
+        run: |
+          if git diff --quiet HEAD^ HEAD -- Dockerfile atp.ApiAutomation.Sharding.csproj Tools/ShardPlanner/ShardPlanner.csproj Tools/ShardPlanner/Program.cs; then
+            echo "Dockerfile/csproj/ShardPlanner unchanged since last commit, skipping rebuild."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Dockerfile, csproj, or ShardPlanner changed, rebuild needed."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push image (Kaniko)
+        if: steps.image-deps.outputs.changed == 'true'
+        run: |
+          kubectl delete job sharding-kaniko-build -n api-automation --ignore-not-found
+          kubectl apply -f k8s/kaniko-build-job.yaml
+          kubectl wait --for=condition=complete job/sharding-kaniko-build -n api-automation --timeout=10m || \
+            (kubectl logs job/sharding-kaniko-build -n api-automation; exit 1)
+          kubectl logs job/sharding-kaniko-build -n api-automation
+
+      # Idempotent - a no-op if it's already running. Applied every run so a
+      # manually torn-down Redis self-heals rather than failing the pipeline.
+      - name: Ensure rate-limiter Redis is deployed
+        run: kubectl apply -f k8s/redis.yaml
+
+      - name: Run single-runner baseline
+        id: run-single
+        if: steps.mode.outputs.mode == 'single'
+        run: |
+          kubectl delete job sharding-run-tests -n api-automation --ignore-not-found
+          kubectl apply -f k8s/test-workspace-pvc.yaml
+          kubectl apply -f k8s/test-job.yaml
+
+          for i in $(seq 1 180); do
+            succeeded=$(kubectl get job sharding-run-tests -n api-automation -o jsonpath='{.status.succeeded}')
+            failed=$(kubectl get job sharding-run-tests -n api-automation -o jsonpath='{.status.failed}')
+            [ "$succeeded" = "1" ] || [ "$failed" = "1" ] && break
+            sleep 5
+          done
+
+          kubectl logs job/sharding-run-tests -n api-automation --all-containers
+
+          echo "start=$(kubectl get job sharding-run-tests -n api-automation -o jsonpath='{.status.startTime}')" >> "$GITHUB_OUTPUT"
+          echo "completion=$(kubectl get job sharding-run-tests -n api-automation -o jsonpath='{.status.completionTime}')" >> "$GITHUB_OUTPUT"
+
+          if [ "$(kubectl get job sharding-run-tests -n api-automation -o jsonpath='{.status.succeeded}')" = "1" ]; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # shard_count is sed-substituted into the local checked-out manifest
+      # (no raw-URL fetch needed - this repo already has its own files) -
+      # the only place that number becomes a real runtime parameter. Wait
+      # condition checks succeeded == shard_count, since every one of the N
+      # indexed completions must finish. Rate limiter's capacity/rate stay
+      # fixed regardless of shard_count - a real AUT quota doesn't grow with
+      # how many shards are hitting it.
+      - name: Run sharded tests
+        id: run-sharded
+        if: steps.mode.outputs.mode == 'sharded'
+        run: |
+          SHARD_COUNT="${{ steps.mode.outputs.shard_count }}"
+          kubectl delete job sharding-run-tests-sharded -n api-automation --ignore-not-found
+          kubectl apply -f k8s/test-workspace-pvc.yaml
+          sed \
+            -e "s/completions: 4/completions: ${SHARD_COUNT}/" \
+            -e "s/parallelism: 4/parallelism: ${SHARD_COUNT}/" \
+            -e "s/--shards 4/--shards ${SHARD_COUNT}/" \
+            k8s/test-job-sharded.yaml | kubectl apply -f -
+
+          for i in $(seq 1 180); do
+            succeeded=$(kubectl get job sharding-run-tests-sharded -n api-automation -o jsonpath='{.status.succeeded}')
+            failed=$(kubectl get job sharding-run-tests-sharded -n api-automation -o jsonpath='{.status.failed}')
+            [ "$succeeded" = "$SHARD_COUNT" ] && break
+            [ -n "$failed" ] && [ "$failed" != "0" ] && break
+            sleep 5
+          done
+
+          for pod in $(kubectl get pods -n api-automation -l job-name=sharding-run-tests-sharded -o jsonpath='{.items[*].metadata.name}'); do
+            echo "=== $pod ==="
+            kubectl logs "$pod" -n api-automation --all-containers || true
+          done
+
+          echo "start=$(kubectl get job sharding-run-tests-sharded -n api-automation -o jsonpath='{.status.startTime}')" >> "$GITHUB_OUTPUT"
+          echo "completion=$(kubectl get job sharding-run-tests-sharded -n api-automation -o jsonpath='{.status.completionTime}')" >> "$GITHUB_OUTPUT"
+
+          if [ "$(kubectl get job sharding-run-tests-sharded -n api-automation -o jsonpath='{.status.succeeded}')" = "$SHARD_COUNT" ]; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Writes the number every "sharding helps" comparison is made from:
+      # trigger single once and sharded a few times with different
+      # shard_count values, and these summaries are directly comparable
+      # without extra tooling.
+      - name: Write timing summary
+        if: always()
+        run: |
+          MODE="${{ steps.mode.outputs.mode }}"
+          if [ "$MODE" = "single" ]; then
+            SHARDS="1"
+            START="${{ steps.run-single.outputs.start }}"
+            END="${{ steps.run-single.outputs.completion }}"
+          else
+            SHARDS="${{ steps.mode.outputs.shard_count }}"
+            START="${{ steps.run-sharded.outputs.start }}"
+            END="${{ steps.run-sharded.outputs.completion }}"
+          fi
+
+          DURATION="n/a"
+          if [ -n "$START" ] && [ -n "$END" ]; then
+            START_EPOCH=$(date -d "$START" +%s 2>/dev/null) && \
+            END_EPOCH=$(date -d "$END" +%s 2>/dev/null) && \
+            DURATION="$((END_EPOCH - START_EPOCH))s"
+          fi
+
+          {
+            echo "## Sharding PoC timing"
+            echo ""
+            echo "| Mode | Shards | Wall-clock | Start | Completion |"
+            echo "|---|---|---|---|---|"
+            echo "| $MODE | $SHARDS | $DURATION | $START | $END |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail the workflow if tests failed
+        if: |
+          (steps.mode.outputs.mode == 'single' && steps.run-single.outputs.passed != 'true') ||
+          (steps.mode.outputs.mode == 'sharded' && steps.run-sharded.outputs.passed != 'true')
+        run: exit 1
