@@ -1,0 +1,22 @@
+# Mounts the same PVC the test Job wrote its report into, purely so
+# `kubectl cp` has a live container to read from (the test Job's own pod
+# is already gone by the time its container exits). Apply after the test
+# Job finishes, `kubectl cp` the report out, then delete this Pod.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sharding-report-retrieval
+  namespace: api-automation
+spec:
+  restartPolicy: Never
+  containers:
+    - name: retrieval
+      image: busybox:1.37
+      command: ["sleep", "300"]
+      volumeMounts:
+        - name: workspace
+          mountPath: /app
+  volumes:
+    - name: workspace
+      persistentVolumeClaim:
+        claimName: sharding-test-workspace

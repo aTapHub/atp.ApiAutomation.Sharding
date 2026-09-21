@@ -1,0 +1,63 @@
+# Phase 2 single-runner baseline: runs all 500 tests in one pod, timed to
+# produce the number every later "sharding helps" claim gets compared
+# against. Mirrors Portfolio's test-job.yaml "mount-fresh-code" pattern: an
+# initContainer clones the repo into a shared PVC, the main container - built
+# from the environment-only image pushed by kaniko-build-job.yaml - mounts
+# that same volume at /app.
+#
+# No AUT here (unlike Portfolio) - the only external dependency is the
+# rate-limiter Redis deployed by ../k8s/redis.yaml into the sharding-poc
+# namespace, reached cross-namespace via its cluster DNS name.
+#
+# Fixtures still run at LevelOfParallelism(75)/ParallelScope.All even in
+# this "single-runner" baseline - intentional, not a bug: shows what
+# horizontal pod scaling adds on top of existing intra-pod concurrency,
+# not against an artificially fully-serial strawman.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sharding-run-tests
+  namespace: api-automation
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: harbor-push-creds
+      initContainers:
+        - name: clone-source
+          image: alpine/git:2.47.1
+          # The PVC is reused across runs (not recreated each time), so wipe
+          # any previous run's contents before cloning. `git clone` refuses
+          # to target a non-empty dir.
+          command: ["sh", "-c"]
+          args:
+            - >-
+              rm -rf /workspace/* /workspace/.[!.]* 2>/dev/null;
+              git clone --depth=1 --branch=main
+              https://github.com/aTapHub/atp.ApiAutomation.Sharding.git /workspace
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+      containers:
+        - name: test
+          image: 192.168.0.139:30003/learning/api-automation-sharding:latest
+          env:
+            - name: REDIS_CONNECTION
+              value: redis.sharding-poc.svc.cluster.local:6379
+          volumeMounts:
+            - name: workspace
+              mountPath: /app
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: sharding-test-workspace

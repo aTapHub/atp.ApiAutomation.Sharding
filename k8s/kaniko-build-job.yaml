@@ -1,0 +1,48 @@
+# Builds the sharding PoC's environment image straight from git (no local
+# build context needed) and pushes it to Harbor under one fixed, mutable
+# tag. Mirrors atp.ApiAutomation.Portfolio's kaniko-build-job.yaml.
+#
+# Shares the api-automation namespace (and its existing Harbor push-creds/CA)
+# with atp.ApiAutomation.Portfolio rather than duplicating them - so resource
+# names here are prefixed "sharding-" to avoid colliding with Portfolio's
+# same-named resources in that namespace.
+#
+# Requires (already present in api-automation, created out of band for
+# Portfolio, reused here):
+#   - ConfigMap "harbor-ca": Harbor's public CA cert, key ca.crt
+#   - Secret "harbor-push-creds" (kubernetes.io/dockerconfigjson): a Harbor
+#     robot account scoped to push/pull on the "learning" project
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sharding-kaniko-build
+  namespace: api-automation
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: kaniko
+          image: ghcr.io/osscontainertools/kaniko:v1.28.4
+          args:
+            - --context=git://github.com/aTapHub/atp.ApiAutomation.Sharding.git#refs/heads/main
+            - --dockerfile=Dockerfile
+            - --destination=192.168.0.139:30003/learning/api-automation-sharding:latest
+            - --registry-certificate=192.168.0.139:30003=/kaniko/harbor-ca/ca.crt
+          volumeMounts:
+            - name: docker-config
+              mountPath: /kaniko/.docker
+            - name: harbor-ca
+              mountPath: /kaniko/harbor-ca
+      volumes:
+        - name: docker-config
+          secret:
+            secretName: harbor-push-creds
+            items:
+              - key: .dockerconfigjson
+                path: config.json
+        - name: harbor-ca
+          configMap:
+            name: harbor-ca
